@@ -1,0 +1,788 @@
+-- Opc_ByVivj_Update script
+print("(Loaded) Opc_ByVivj_Update script for GrowSoft")
+
+-- System Configuration --
+local SAVE_KEY = "VivJ_" .. getServerID()  -- Unique save key per server (VivJ_SERVERID)
+local DEFAULT_REWARD_INTERVAL_SECS = 300   -- 5 minutes (300 seconds) default
+local OPC_REWARD_INTERVAL = DEFAULT_REWARD_INTERVAL_SECS -- Active interval, loaded from save (NEW)
+local CURRENCY_NAME = "OPC"                -- Currency displayed name
+local SHOP_TITLE = "Online Point Market"
+local MAX_INV_CHECK = 200                  -- Max player inventory limit check
+local MAX_LB_PLAYERS = 250                 -- Max players to check for leaderboard
+
+-- Role Level Definitions (Standard GrowSoft Roles)
+local ROLES = {
+    DEFAULT = 0,
+    DEV = 51,
+    ADMIN = 52  -- Role required for full shop management
+}
+
+-- Commands
+local CMD_SHOW_SHOP = "opc"
+local CMD_SHOW_LB = "opclb"
+local CMD_GIVE = "giveopc"
+local CMD_REMOVE = "removeopc"
+local CMD_SEND = "sendopc"
+local CMD_ADMIN_PANEL = "opcadmin"
+
+-- Global Data Tables
+local PLAYER_NAMES = PLAYER_NAMES or {}
+local POINT_DATA = {}
+local ACTIVE_TIMERS = {}
+local TEMP_ITEM_ADD = TEMP_ITEM_ADD or {} -- Holds item data during admin dialog flow
+local DIALOG_MAP = {}                    -- Maps dialog button index to item data
+
+-- Default Item Lists (Will be overwritten by saved data if available)
+local STARTER_ITEMS = {
+    {itemID = 20534, qty = 1, cost = 1},
+    {itemID = 202, qty = 25, cost = 5},
+    {itemID = 204, qty = 10, cost = 5},
+    {itemID = 206, qty = 4, cost = 5},
+    {itemID = 242, qty = 1, cost = 5},
+    {itemID = 6140, qty = 1, cost = 10},
+    {itemID = 20536, qty = 1, cost = 25},
+    {itemID = 20538, qty = 1, cost = 100},
+    {itemID = 20234, qty = 1, cost = 100},
+}
+
+local POPULAR_ITEMS = {
+    {itemID = 4994, qty = 1, cost = 250},
+    {itemID = 20258, qty = 1, cost = 250},
+    {itemID = 20614, qty = 1, cost = 500},
+    {itemID = 1796, qty = 1, cost = 500},
+    {itemID = 9114, qty = 1, cost = 500},
+    {itemID = 4654, qty = 1, cost = 500},
+    {itemID = 20616, qty = 1, cost = 750},
+    {itemID = 5264, qty = 1, cost = 1000},
+    {itemID = 12380, qty = 1, cost = 1000},
+}
+
+local PREMIUM_ITEMS = {
+    {itemID = 12390, qty = 1, cost = 147},
+    {itemID = 9344, qty = 1, cost = 6500},
+    {itemID = 1970, qty = 1, cost = 350},
+    {itemID = 12388, qty = 1, cost = 270},
+    {itemID = 8286, qty = 1, cost = 320},
+    {itemID = 14414, qty = 1, cost = 500},
+    {itemID = 7188, qty = 1, cost = 2300},
+    {itemID = 20628, qty = 1, cost = 4800},
+}
+
+local ALL_SHOP_ITEMS = {
+    starter = STARTER_ITEMS,
+    popular = POPULAR_ITEMS,
+    premium = PREMIUM_ITEMS,
+}
+
+
+-- Utility Functions --
+
+local function loadData()
+    local data = loadDataFromServer(SAVE_KEY)
+    if data then
+        POINT_DATA = data.OPC or {}
+        PLAYER_NAMES = data.Names or {}
+        OPC_REWARD_INTERVAL = data.Interval or DEFAULT_REWARD_INTERVAL_SECS -- LOAD NEW INTERVAL
+        
+        -- Load custom shop item data
+        STARTER_ITEMS = data.StarterItems or STARTER_ITEMS
+        POPULAR_ITEMS = data.PopularItems or POPULAR_ITEMS
+        PREMIUM_ITEMS = data.PremiumItems or PREMIUM_ITEMS
+
+        ALL_SHOP_ITEMS.starter = STARTER_ITEMS
+        ALL_SHOP_ITEMS.popular = POPULAR_ITEMS
+        ALL_SHOP_ITEMS.premium = PREMIUM_ITEMS
+        
+        print("[OPC] Data loaded.")
+    else
+        POINT_DATA = {}
+        PLAYER_NAMES = {}
+        OPC_REWARD_INTERVAL = DEFAULT_REWARD_INTERVAL_SECS -- SET DEFAULT
+        print("[OPC] No save data found. Using defaults.")
+    end
+end
+
+local function saveData()
+    saveDataToServer(SAVE_KEY, { 
+        OPC = POINT_DATA, 
+        Names = PLAYER_NAMES, 
+        StarterItems = STARTER_ITEMS,
+        PopularItems = POPULAR_ITEMS,
+        PremiumItems = PREMIUM_ITEMS,
+        Interval = OPC_REWARD_INTERVAL, -- SAVE NEW INTERVAL
+    })
+    print("[OPC] Data saved.")
+end
+
+local function formatTime(seconds)
+    local min = math.floor(seconds / 60)
+    local sec = seconds % 60
+    
+    if min > 0 and sec > 0 then
+        return string.format("%d minute%s %d second%s", min, min ~= 1 and "s" or "", sec, sec ~= 1 and "s" or "")
+    elseif min > 0 then
+        return string.format("%d minute%s", min, min ~= 1 and "s" or "")
+    else
+        return string.format("%d second%s", sec, sec ~= 1 and "s" or "")
+    end
+end
+
+local function getPlayer(name)
+    local target = string.lower(name)
+    for _, p in ipairs(getServerPlayers()) do
+        if string.lower(p:getCleanName()) == target then
+            return p
+        end
+    end
+    return nil
+end
+
+local function commaSeparate(amount)
+    local s = tostring(amount)
+    local formatted = s
+    while true do
+        formatted, count = formatted:gsub("^(-?%d+)(%d%d%d)", '%1,%2')
+        if count == 0 then break end
+    end
+    return formatted
+end
+
+
+-- Command Registration --
+registerLuaCommand({ command = CMD_SHOW_SHOP, roleRequired = ROLES.DEFAULT, description = "Open OPC Shop Dialog" })
+registerLuaCommand({ command = CMD_GIVE, roleRequired = ROLES.DEV, description = "Give OPC to a player" })
+registerLuaCommand({ command = CMD_REMOVE, roleRequired = ROLES.DEV, description = "Remove OPC from a player" })
+registerLuaCommand({ command = CMD_SHOW_LB, roleRequired = ROLES.DEFAULT, description = "Open OPC Leaderboard" })
+registerLuaCommand({ command = CMD_SEND, roleRequired = ROLES.DEFAULT, description = "Send OPC to a player" })
+registerLuaCommand({ command = CMD_ADMIN_PANEL, roleRequired = ROLES.ADMIN, description = "Open OPC Admin Panel" })
+
+
+-- Dialog Builders --
+
+local function showShop(player)
+    local userID = player:getUserID()
+    local opc = POINT_DATA[userID] or 0
+    local dialog = "set_bg_color|170,175,180,255|\n"
+    dialog = dialog .. "set_border_color|0,192,203,255|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_label_with_icon|big|`w" .. SHOP_TITLE .. "|left|9474|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    -- Use the active interval time
+    dialog = dialog .. "add_textbox|`7Welcome! Earn 1 " .. CURRENCY_NAME .. " every `w" .. formatTime(OPC_REWARD_INTERVAL) .. "`7 by staying online.|left|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_label_with_icon|small|" .. player:getName() .. "|left|12436|\n"
+    dialog = dialog .. "add_smalltext|`7Your current balance: `w" .. commaSeparate(opc) .. " " .. CURRENCY_NAME .. "|\n"
+    dialog = dialog .. "add_spacer|big|\n"
+    dialog = dialog .. "text_scaling_string|aaaaaaaaaa|\n"
+
+    DIALOG_MAP = {}
+    local buttonIndex = 1
+
+    local function addShopSection(title, items, categoryName)
+        if #items == 0 then return end
+
+        dialog = dialog .. string.format("add_label_with_icon|medium|`w%s|left|7074|\n", title)
+        dialog = dialog .. "add_spacer|small|\n"
+
+        for i, item in ipairs(items) do
+            DIALOG_MAP[buttonIndex] = { category = categoryName, index = i }
+
+            local frameStyle = "staticYellowFrame"
+                
+            if categoryName == "starter" then
+                frameStyle = "staticBlueFrame"
+            elseif categoryName == "popular" then
+                frameStyle = "staticPurpleFrame"
+            elseif categoryName == "premium" then 
+                frameStyle = "staticOrangeFrame"
+            end
+
+            dialog = dialog .. string.format(
+                "add_button_with_icon|var_%d||%s|%d|%d|left|\n",
+                buttonIndex, frameStyle, item.itemID, item.cost
+            )
+
+            buttonIndex = buttonIndex + 1
+        end
+    
+        dialog = dialog .. "add_custom_break|\n"
+        dialog = dialog .. "add_spacer|small|\n"
+    end
+
+    addShopSection("`wStarter Section", STARTER_ITEMS, "starter")
+    addShopSection("`wPopular Section", POPULAR_ITEMS, "popular")
+    addShopSection("`wPremium Section", PREMIUM_ITEMS, "premium")
+
+    dialog = dialog .. "add_label_with_icon|big||left|0|\n"
+    dialog = dialog .. "add_quick_exit|\n"
+    dialog = dialog .. "end_dialog|opc_shop_dialog|||\n"
+
+    player:onDialogRequest(dialog)
+end
+
+local function showConfirmPurchase(player, buttonIndex)
+    local mapping = DIALOG_MAP[buttonIndex]
+    if not mapping then return end
+
+    local category, index = mapping.category, mapping.index
+    local item = ALL_SHOP_ITEMS[category] and ALL_SHOP_ITEMS[category][index]
+
+    if not item then return end
+
+    local userID = player:getUserID()
+    local opc = POINT_DATA[userID] or 0
+
+    local itemDef = getItem(item.itemID)
+    local name = itemDef:getName()
+    local rarity = itemDef:getRarity()
+    local description = itemDef:getDescription()
+
+    local dialog = "set_bg_color|170,175,180,255|\n"
+    dialog = dialog .. "set_border_color|0,192,203,255|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_label_with_icon|big|`wConfirm Purchase|left|6292|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_smalltext|`wItem: `7" .. name .. "|\n"
+    dialog = dialog .. "add_smalltext|`wQuantity: `7" .. item.qty .. "|\n"
+    dialog = dialog .. "add_smalltext|`wPrice: `7" .. commaSeparate(item.cost) .. " " .. CURRENCY_NAME .. "|\n"
+    dialog = dialog .. (rarity == 999 and "add_smalltext|`wRarity: `7No rarity|\n" or "add_smalltext|`wRarity: `7" .. rarity .. "|\n")
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_label_with_icon|big||left|" .. item.itemID .. "|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_smalltext|`wItem Description:|\n"
+    dialog = dialog .. "add_smalltext|`7" .. description .. "|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_smalltext|`w(Your balance: " .. commaSeparate(opc) .. " " .. CURRENCY_NAME .. ")|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. string.format("add_custom_button|confirm_opc_buy_%d|textLabel:`wBUY for %s %s|\n", buttonIndex, commaSeparate(item.cost), CURRENCY_NAME)
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_button|back_to_shop|`wGo Back|\n"
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_label_with_icon|big||left|0|\n"
+    dialog = dialog .. "add_quick_exit|\n"
+    dialog = dialog .. "end_dialog|confirm_shop_dialog|||\n"
+    player:onDialogRequest(dialog)
+end
+
+local function showLeaderboard(player)
+    local lb = {}
+
+    for userID = 1, MAX_LB_PLAYERS do
+        local opc = POINT_DATA[userID]
+
+        if opc ~= nil then
+            table.insert(lb, { userID = userID, opc = opc })
+        end
+    end
+
+    table.sort(lb, function(a, b)
+        return a.opc > b.opc
+    end)
+
+    local dialog = "set_default_color|`o\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_label_with_icon|big|`w" .. CURRENCY_NAME .. " Leaderboard|left|15076|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_smalltext|`oShowing top " .. math.min(25, #lb) .. " players|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+
+    for i = 1, math.min(25, #lb) do
+        local entry = lb[i]
+        local name = PLAYER_NAMES[entry.userID] or ("UserID " .. entry.userID)
+
+        dialog = dialog .. string.format("add_textbox|`w#%d `o%s `w- %s %s|left|\n", i, name, commaSeparate(entry.opc), CURRENCY_NAME)
+    end
+
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "end_dialog|opc_lb_dialog||Close|\n"
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_label_with_icon|big||left|0|\n"
+
+    player:onDialogRequest(dialog)
+end
+
+local function buildItemListView(currentDialog, categoryName, items, itemIconID)
+    local dialog = currentDialog
+    local prefix = categoryName:lower()
+    dialog = dialog .. string.format("add_label_with_icon|medium|`wCurrent %s Items (%d)|left|%d|\n", categoryName, #items, itemIconID)
+    dialog = dialog .. "add_spacer|small|\n"
+    
+    local counter = 0
+    for i, item in ipairs(items) do
+        -- Delete button
+        dialog = dialog .. string.format(
+            "add_button_with_icon|remove_%s_%d||staticRedFrame|%d|%d|left|\n",
+            prefix, i, item.itemID, item.cost
+        )
+        counter = counter + 1
+        
+        -- New row after 5 items
+        if counter % 5 == 0 or i == #items then
+            dialog = dialog .. "add_custom_break|\n"
+        end
+    end
+    dialog = dialog .. "add_spacer|big|\n"
+    return dialog
+end
+
+local function showCategorySelect(player, itemDef, itemData)
+    local dialog = "set_bg_color|170,175,180,255|\n"
+    dialog = dialog .. "set_border_color|0,192,203,255|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_label_with_icon|big|`wSelect Item Category|left|2904|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    
+    -- Item Review
+    dialog = dialog .. "add_smalltext|`wAdding: `7" .. itemDef:getName() .. " x" .. itemData.qty .. "|\n"
+    dialog = dialog .. "add_smalltext|`wPrice: `7" .. commaSeparate(itemData.price) .. " " .. CURRENCY_NAME .. "|\n"
+    dialog = dialog .. "add_label_with_icon|medium||left|" .. itemData.itemID .. "|\n"
+    dialog = dialog .. "add_spacer|big|\n"
+    
+    -- Category Buttons (with spacers)
+    dialog = dialog .. "add_custom_button|select_category_starter|textLabel:`bAdd to Starter Section|\n"
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_spacer|small|\n" 
+    dialog = dialog .. "add_custom_button|select_category_popular|textLabel:`pAdd to Popular Section|\n"
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_spacer|small|\n" 
+    dialog = dialog .. "add_custom_button|select_category_premium|textLabel:`oAdd to Premium Section|\n"
+    dialog = dialog .. "add_custom_break|\n"
+
+    dialog = dialog .. "add_spacer|big|\n"
+    dialog = dialog .. "add_button|back_to_admin_panel|`wCancel and Go Back|\n"
+    dialog = dialog .. "end_dialog|category_selection_dialog|||\n"
+    
+    player:onDialogRequest(dialog)
+end
+
+local function showAdminPanel(player) 
+    local dialog = "set_bg_color|170,175,180,255|\n"
+    dialog = dialog .. "set_border_color|0,192,203,255|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_label_with_icon|big|`w" .. CURRENCY_NAME .. " Admin Panel|left|1374|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    dialog = dialog .. "add_smalltext|`7Manage items for the market.|bold|\n"
+    dialog = dialog .. "add_spacer|big|\n"
+    
+    -- NEW: System Configuration Section
+    dialog = dialog .. "add_label_with_icon|medium|`wSystem Configuration|left|1668|\n" -- Icon Gear
+    dialog = dialog .. "add_spacer|small|\n"
+    
+    dialog = dialog .. "add_textbox|`wOPC Reward Interval (Seconds):|\n"
+    dialog = dialog .. string.format("add_text_input|input_reward_interval|%d|1|6|\n", OPC_REWARD_INTERVAL) -- Display current value
+    dialog = dialog .. "add_spacer|small|\n"
+    
+    dialog = dialog .. "add_custom_button|save_admin_settings|textLabel:`wSave Configuration Settings|\n"
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_spacer|big|\n"
+    
+    -- Existing: Add New Item
+    dialog = dialog .. "add_label_with_icon|medium|`wAdd New Item|left|2904|\n"
+    dialog = dialog .. "add_spacer|small|\n"
+    
+    dialog = dialog .. "add_textbox|`wItemID:|\n"
+    dialog = dialog .. "add_text_input|input_itemid||1|5|\n" 
+    dialog = dialog .. "add_textbox|`wQuantity:|\n"
+    dialog = dialog .. "add_text_input|input_amount||1|5|\n" 
+    dialog = dialog .. "add_textbox|`wPrice (" .. CURRENCY_NAME .. "):|\n"
+    dialog = dialog .. "add_text_input|input_price||1|7|\n" 
+    
+    -- Step 1 button
+    dialog = dialog .. "add_custom_button|validate_and_show_category|textLabel:`wAdd Item & Select Category|\n"
+    
+    dialog = dialog .. "add_custom_break|\n"
+    dialog = dialog .. "add_spacer|big|\n"
+    
+    -- Item Listings
+    dialog = buildItemListView(dialog, "Starter", STARTER_ITEMS, 20534)
+    dialog = buildItemListView(dialog, "Popular", POPULAR_ITEMS, 4994)
+    dialog = buildItemListView(dialog, "Premium", PREMIUM_ITEMS, 9344)
+
+
+    dialog = dialog .. "add_label_with_icon|big||left|0|\n"
+    dialog = dialog .. "add_quick_exit|\n"
+    dialog = dialog .. "end_dialog|opc_admin_dialog|||\n"
+
+    player:onDialogRequest(dialog)
+end
+
+
+-- Command Handlers --
+onPlayerCommandCallback(function(world, player, fullCommand)
+    local args = {}
+    for word in fullCommand:gmatch("%S+") do
+        table.insert(args, word)
+    end
+
+    local cmd = args[1]
+
+    if cmd == CMD_SHOW_SHOP then
+        showShop(player)
+        player:playAudio("spell1.wav")
+        return true
+    elseif cmd == CMD_SHOW_LB then
+        showLeaderboard(player)
+        player:playAudio("spell1.wav")
+        return true
+    elseif cmd == CMD_ADMIN_PANEL and player:hasRole(ROLES.ADMIN) then
+        showAdminPanel(player)
+        player:playAudio("spell1.wav")
+        return true
+    end
+
+    -- Currency Management Commands (DEV/ADMIN)
+    if (cmd == CMD_GIVE or cmd == CMD_REMOVE) and player:hasRole(ROLES.DEV) then
+        local targetName = args[2]
+        local amount = tonumber(args[3] or "")
+
+        if not targetName or not amount or amount <= 0 then
+            player:onConsoleMessage("Usage: /" .. cmd .. " <playerName> <amount> (amount > 0)")
+            return true
+        end
+
+        local target = getPlayer(targetName)
+        if not target then
+            player:onConsoleMessage("`4Player '" .. targetName .. "' not found or not online.")
+            return true
+        end
+
+        local targetID = target:getUserID()
+        POINT_DATA[targetID] = POINT_DATA[targetID] or 0
+
+        if cmd == CMD_GIVE then
+            POINT_DATA[targetID] = POINT_DATA[targetID] + amount
+            player:onConsoleMessage("`2Gave " .. amount .. " " .. CURRENCY_NAME .. " to " .. target:getName() .."!")
+            target:onConsoleMessage("`2You received " .. amount .. " " .. CURRENCY_NAME .. " from a Developer!")
+        else
+            POINT_DATA[targetID] = math.max(0, POINT_DATA[targetID] - amount)
+            player:onConsoleMessage("`4Removed " .. amount .. " " .. CURRENCY_NAME .. " from " .. target:getName() .."!")
+            target:onConsoleMessage("`4A Developer removed " .. amount .. " " .. CURRENCY_NAME .. " from your balance!")
+        end
+        target:playAudio("gauntlet_spawn.wav");
+        player:playAudio("gauntlet_spawn.wav");
+        saveData()
+        return true
+    end
+    
+    -- Player-to-Player Send Command
+    if cmd == CMD_SEND and player:hasRole(ROLES.DEFAULT) then
+        local targetName = args[2]
+        local amount = tonumber(args[3] or "")
+
+        if not targetName or not amount or amount <= 0 then
+            player:onConsoleMessage("Usage: /" .. cmd .. " <playerName> <amount> (amount > 0)")
+            return true
+        end
+        
+        local senderID = player:getUserID()
+        local target = getPlayer(targetName)
+        
+        if not target or target:getUserID() == senderID then
+             player:onConsoleMessage("`4Player '" .. targetName .. "' not found or you cannot send to yourself.")
+             return true
+        end
+        
+        local targetID = target:getUserID()
+        
+        POINT_DATA[senderID] = POINT_DATA[senderID] or 0
+        
+        if POINT_DATA[senderID] < amount then
+            player:onConsoleMessage("`4Insufficient " .. CURRENCY_NAME .. " balance!")
+            return true
+        end
+
+        -- Transfer
+        POINT_DATA[senderID] = POINT_DATA[senderID] - amount
+        POINT_DATA[targetID] = (POINT_DATA[targetID] or 0) + amount
+
+        -- Notify
+        player:onConsoleMessage("`2Sent " .. amount .. " " .. CURRENCY_NAME .. " to " .. target:getName() .. "!")
+        target:onConsoleMessage("`2You received " .. amount .. " " .. CURRENCY_NAME .. " from " .. player:getName() .. "!")
+        target:playAudio("gauntlet_spawn.wav");
+        player:playAudio("gauntlet_spawn.wav");
+
+        saveData()
+        return true
+    end
+
+    return false
+end)
+
+
+-- Dialog Handlers --
+onPlayerDialogCallback(function(world, player, data)
+    local dialogName = data["dialog_name"] or ""
+    local buttonClicked = data["buttonClicked"] or ""
+
+    if dialogName == "opc_shop_dialog" then
+        local index = tonumber(buttonClicked:match("^var_(%d+)$"))
+        if index then
+            showConfirmPurchase(player, index)
+            return true
+        end
+    end
+
+    if dialogName == "confirm_shop_dialog" then
+        if buttonClicked == "back_to_shop" then
+            showShop(player)
+            return true
+        end
+        
+        if buttonClicked:find("confirm_opc_buy_") then
+            local buttonIndex = tonumber(buttonClicked:match("confirm_opc_buy_(%d+)"))
+            if not buttonIndex then return true end
+
+            local mapping = DIALOG_MAP[buttonIndex]
+            if not mapping then return true end
+
+            local category, index = mapping.category, mapping.index
+            local item = ALL_SHOP_ITEMS[category] and ALL_SHOP_ITEMS[category][index]
+
+            if not item then return true end
+
+            local userID = player:getUserID()
+            local opc = POINT_DATA[userID] or 0
+
+            if opc < item.cost then
+                player:onTalkBubble(player:getNetID(), "`4Not enough " .. CURRENCY_NAME .. "!", 0)
+                player:onConsoleMessage("`4Error: Insufficient " .. CURRENCY_NAME .. " balance!")
+                player:playAudio("bleep_fail.wav")
+                return true
+            end
+
+            if player:getItemAmount(item.itemID) + item.qty > MAX_INV_CHECK then
+                player:onTalkBubble(player:getNetID(), "`4Not enough inventory space!", 0)
+                player:onConsoleMessage("`4Error: Not enough inventory space!")
+                player:playAudio("bleep_fail.wav")
+                return true
+            end
+
+            POINT_DATA[userID] = opc - item.cost
+            player:changeItem(item.itemID, item.qty, 0)
+            saveData()
+
+            player:onTalkBubble(player:getNetID(), "`2Purchase successful!", 0)
+            player:onConsoleMessage("`2Bought " .. getItem(item.itemID):getName() .. " for " .. item.cost .. " " .. CURRENCY_NAME .. "!")
+            world:useItemEffect(player:getNetID(), item.itemID, 0, 100)
+            player:playAudio("piano_nice.wav")
+            showShop(player) -- Refresh shop
+            return true
+        end
+    end
+
+    -- Admin Panel Dialog Handling
+    if dialogName == "opc_admin_dialog" then
+        local userID = player:getUserID()
+
+        -- NEW: Save Configuration Settings
+        if buttonClicked == "save_admin_settings" then
+            local newInterval = tonumber(data["input_reward_interval"] or "")
+
+            if not newInterval or newInterval <= 0 then
+                player:onConsoleMessage("`4Invalid interval value. Must be a positive number of seconds.")
+                showAdminPanel(player)
+                return true
+            end
+
+            OPC_REWARD_INTERVAL = newInterval
+            saveData()
+            player:onConsoleMessage("`2OPC Reward Interval updated to " .. newInterval .. " seconds.")
+            player:playAudio("success.wav")
+            showAdminPanel(player)
+            return true
+        end
+        -- END NEW: Save Configuration Settings
+
+        -- Step 1: Validate input
+        if buttonClicked == "validate_and_show_category" then
+            local itemID = tonumber(data["input_itemid"] or "")
+            local qty = tonumber(data["input_amount"] or "")
+            local price = tonumber(data["input_price"] or "")
+
+            if not itemID or itemID <= 0 or not qty or qty <= 0 or not price or price <= 0 then
+                player:onConsoleMessage("`4Invalid input. ItemID, Quantity, and Price must be positive numbers.")
+                showAdminPanel(player)
+                return true
+            end
+
+            local itemDef = getItem(itemID)
+            if not itemDef or itemDef:getName() == "Nothing" then
+                player:onConsoleMessage("`4Invalid ItemID: Item not found.")
+                showAdminPanel(player)
+                return true
+            end
+            
+            -- Store temp data and go to step 2
+            TEMP_ITEM_ADD[userID] = { itemID = itemID, qty = qty, price = price }
+            showCategorySelect(player, itemDef, TEMP_ITEM_ADD[userID])
+            return true
+        end
+
+        -- Item Removal Logic
+        local function handleItemRemoval(prefix, button)
+            local index = tonumber(button:match("^remove_" .. prefix .. "_(%d+)$"))
+            local items = ALL_SHOP_ITEMS[prefix]
+
+            if index and index >= 1 and index <= #items then
+                local removedItem = table.remove(items, index)
+                saveData()
+                local itemDef = getItem(removedItem.itemID)
+                local catName = prefix:sub(1, 1):upper() .. prefix:sub(2) .. " Section"
+                player:onConsoleMessage("`2Removed " .. (itemDef and itemDef:getName() or "Unknown Item") .. " from " .. catName .. ".")
+                showAdminPanel(player)
+                return true
+            end
+            return false
+        end
+
+        if handleItemRemoval("starter", buttonClicked) then return true end
+        if handleItemRemoval("popular", buttonClicked) then return true end
+        if handleItemRemoval("premium", buttonClicked) then return true end
+
+        return true
+    end
+    
+    -- Category Selection Dialog Handling
+    if dialogName == "category_selection_dialog" then
+        local userID = player:getUserID()
+        local itemData = TEMP_ITEM_ADD[userID]
+        local category = nil
+
+        if not itemData then
+            player:onConsoleMessage("`4Error: Item data lost. Try again.")
+            showAdminPanel(player)
+            return true
+        end
+        
+        if buttonClicked == "select_category_starter" then
+            category = "starter"
+        elseif buttonClicked == "select_category_popular" then
+            category = "popular"
+        elseif buttonClicked == "select_category_premium" then
+            category = "premium"
+        elseif buttonClicked == "back_to_admin_panel" then
+            TEMP_ITEM_ADD[userID] = nil -- Cancel
+            showAdminPanel(player)
+            return true
+        end
+
+        if category then
+            local itemID = itemData.itemID
+            local qty = itemData.qty
+            local price = itemData.price
+            
+            -- Add item
+            table.insert(ALL_SHOP_ITEMS[category], { itemID = itemID, qty = qty, cost = price })
+            saveData()
+
+            local itemDef = getItem(itemID)
+            local catName = category:sub(1, 1):upper() .. category:sub(2) .. " Section"
+            
+            player:onConsoleMessage("`2Added " .. itemDef:getName() .. " x" .. qty .. " to " .. catName .. " for " .. commaSeparate(price) .. " " .. CURRENCY_NAME .. "!")
+            player:playAudio("success.wav")
+            
+            -- Clean up temp data and return to main panel
+            TEMP_ITEM_ADD[userID] = nil 
+            showAdminPanel(player)
+            return true
+        end
+
+        return true
+    end
+
+    return false
+end)
+
+
+-- Timer/Tick Handlers --
+
+local function startTimer(player)
+    local userID = player:getUserID()
+    local now = os.time()
+
+    if not ACTIVE_TIMERS[userID] then
+        ACTIVE_TIMERS[userID] = { accruedTime = 0, lastTick = now, active = true }
+    else
+        ACTIVE_TIMERS[userID].lastTick = now
+        ACTIVE_TIMERS[userID].active = true
+    end
+
+    if POINT_DATA[userID] == nil then
+        POINT_DATA[userID] = 0
+    end
+end
+
+local function pauseTimer(player)
+    local userID = player:getUserID()
+    if ACTIVE_TIMERS[userID] then
+        ACTIVE_TIMERS[userID].active = false
+    end
+end
+
+local function clearTimer(player)
+    local userID = player:getUserID()
+    ACTIVE_TIMERS[userID] = nil
+end
+
+onPlayerEnterWorldCallback(function(world, player)
+    startTimer(player)
+end)
+
+onPlayerLeaveWorldCallback(function(world, player)
+    pauseTimer(player)
+end)
+
+onPlayerDisconnectCallback(function(player)
+    clearTimer(player)
+end)
+
+onWorldTick(function(world)
+    local now = os.time()
+    for userID, timer in pairs(ACTIVE_TIMERS) do
+        if timer.active then
+            local elapsed = now - timer.lastTick
+            if elapsed > 0 then
+                timer.accruedTime = (timer.accruedTime or 0) + elapsed
+                timer.lastTick = now
+
+                -- Use the dynamic interval
+                while timer.accruedTime >= OPC_REWARD_INTERVAL do
+                    timer.accruedTime = timer.accruedTime - OPC_REWARD_INTERVAL
+                    POINT_DATA[userID] = (POINT_DATA[userID] or 0) + 1
+                    
+                    for _, p in ipairs(getServerPlayers()) do
+                        if p:getUserID() == userID then
+                            p:onConsoleMessage("`2+1 " .. CURRENCY_NAME .. " reward!")
+                            p:playAudio("bell.wav")
+                            break
+                        end
+                    end
+
+                    saveData()
+                end
+            end
+        else
+            timer.lastTick = now
+        end
+    end
+end)
+
+
+-- Initial Setup and Login Handler --
+loadData()
+
+-- Re-initialize timers for currently online players on script reload
+for _, player in ipairs(getServerPlayers()) do
+    startTimer(player)
+end
+
+onPlayerLoginCallback(function(player)
+    local userID = player:getUserID()
+    local name = tostring(player:getName())
+    -- Update name mapping for leaderboard consistency
+    PLAYER_NAMES[userID] = name
+    saveData()
+end)
